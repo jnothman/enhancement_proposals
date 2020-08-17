@@ -236,6 +236,7 @@ This is already feasible in Scikit-learn, but:
 * it fails to make clear what the "one obvious way to do it" is for users.
 * there are tricky edge cases for metaestimator implementation, especially
   when the meta-estimator can act as a classifier, regressor, transformer, etc.
+  Creating a notion of resamplers lowers the bar for entry.
 
 Alternative: sample_weight modification only
 ............................................
@@ -248,6 +249,18 @@ resampling, including sample removal. However, the current limitations are:
   uses original samples);
 * ``sample_weight`` needs to be passed and modified within a
   ``Pipeline``, which isn't possible without something like resamplers.
+
+Support for changing feature space as well as sample space?
+-----------------------------------------------------------
+
+The proposal above currently disallows modifying feature space. There are use
+cases where the feature and sample space should both be modified, such as in
+order to load both X and y from an external resource. This could be
+accommodated by allowing ``fit_resample`` to modify the feature space, and
+having resamplers (optionally) implement ``transform`` which would be called by
+ResampledTrainer only at test time. A decision on whether to support this usage
+may be deferred as long as ResampledTrainer rejects resamplers that also have
+`transform` implemented.
 
 Support for fit_resample in existing estimators
 -----------------------------------------------
