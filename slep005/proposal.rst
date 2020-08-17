@@ -16,17 +16,21 @@ Abstract
 
 We propose the inclusion of a new type of estimator: resampler. The
 resampler will change the samples in ``X`` and ``y`` and return both
-``Xt`` and ``yt``. In short:
+``Xt`` and ``yt``, as well as any other keyword arguments, and applies only
+to the training set.
+
+In short:
 
 * a new verb/method that all resamplers must implement is introduced:
   ``fit_resample``.
 * resamplers are able to reduce and/or augment the number of samples in
   ``X`` and ``y`` during ``fit``, but will perform no changes during
-  ``predict``.
+  ``predict``. While ``fit_transform`` is required to maintain direct
+  correspondence between each input and output sample, ``fit_resample`` does
+  not need its input and output to have sample-wise correspondence.
 * to facilitate this behavior a new meta-estimator (``ResampledTrainer``) that
   allows for the composition of resamplers and estimators is proposed.
-  Alternatively we propose changes to ``Pipeline`` that also enable similar
-  compositions.
+  Alternatively, changes to ``Pipeline`` could facilitate similar compositions.
 
 
 Motivation
@@ -36,19 +40,19 @@ Sample reduction or augmentation are common parts of machine-learning
 pipelines. The current scikit-learn API does not offer support for such
 use cases.
 
-Possible Usecases
-.................
+Possible Use Cases
+..................
 
-* Sample rebalancing to correct bias toward class with large cardinality.
+* Sample rebalancing to correct bias toward a class with large cardinality.
 * Outlier rejection to fit a clean dataset.
 * Sample reduction e.g. representing a dataset by its k-means centroids.
+* NaNRejector (drop all samples that contain nan).
+* Dataset augmentation (like is commonly done in deep learning).
 * Currently semi-supervised learning is not supported by scoring-based
   functions like ``cross_val_score``, ``GridSearchCV`` or ``validation_curve``
   since the scorers will regard "unlabeled" as a separate class. A resampler
   could add the unlabeled samples to the dataset during fit time to solve this
   (note that this could also be solved by a new cv splitter).
-* NaNRejector (drop all samples that contain nan).
-* Dataset augmentation (like is commonly done in DL).
 
 Implementation
 --------------
@@ -58,13 +62,14 @@ API and Constraints
 
 * Resamplers implement a method ``fit_resample(X, y, **kwargs)``, a pure
   function which returns ``Xt, yt, kwargs`` corresponding to the resampled
-  dataset, where samples may have been added and/or removed.
+  dataset, where returned samples do not necessarily correspond to input
+  samples.
 * An estimator may only implement either ``fit_transform`` or ``fit_resample``
   if support for ``Resamplers`` in ``Pipeline`` is enabled
   (see Sect. "Limitations").
-* Resamplers may not change the order, meaning, dtype or format of features
-  (this is left to transformers).
-* Resamplers should also handled (e.g. resample, generate anew, etc.) any
+* While they are free to reorder samples, resamplers may not change the order,
+  meaning, dtype or format of features (this is left to transformers).
+* Resamplers should also handle (e.g. resample, generate anew, etc.) any
   kwargs.
 
 Composition
@@ -80,16 +85,18 @@ Alternative 1: ResampledTrainer
 This metaestimator composes a resampler and a predictor. It
 behaves as follows:
 
-* ``fit(X, y)``: resample ``X, y`` with the resampler, then fit the predictor
-  on the resampled dataset.
+* ``fit(X, y, **kw)``: resample ``X, y, kw`` with the resampler, then fit the
+  predictor on the resampled dataset.
 * ``predict(X)``: simply predict on ``X`` with the predictor.
 * ``score(X)``: simply score on ``X`` with the predictor.
 
-See PR #13269 for an implementation.
+See :issue:`#13269` for an implementation.
 
-One benefit of the ``ResampledTrainer`` is that it does not stop the resampler
-having other methods, such as ``transform``, as it is clear that the
-``ResampledTrainer`` will only call ``fit_resample``.
+The ``ResampledTrainer`` may not be as intuitive for usage as extending
+``Pipeline`` to support resampling, but it is unambiguous as to which
+estimators and contexts will receive resampled data, and which not.
+Its implementation and testing is straightforward, unlike a new feature
+addition to the already-complicated ``Pipeline`` implementation.
 
 There are complications around supporting ``fit_transform``, ``fit_predict``
 and ``fit_resample`` methods in ``ResampledTrainer``. ``fit_transform`` support
@@ -99,7 +106,12 @@ y).transform(X)``, rather than calling ``fit_transform`` of the predictor.
 would not work with non-inductive estimators (TSNE, AgglomerativeClustering,
 etc.) as their final step.  If the predictor of a ``ResampledTrainer`` is
 itself a resampler, it's unclear how ``ResampledTrainer.fit_resample`` should
-behave.  These caveats also apply to the Pipeline modification below.
+behave. In short, only plain ``fit`` should be executed on the predictor.
+These caveats also apply to the Pipeline modification below.
+
+One benefit of the ``ResampledTrainer`` is that it does not stop the resampler
+having other methods, such as ``transform``, as it is clear that the
+``ResampledTrainer`` will only call ``fit_resample``.
 
 Example Usage:
 ~~~~~~~~~~~~~~
@@ -137,7 +149,7 @@ Limitations
 
 .. rubric:: Prohibiting ``transform`` on resamplers
 
-It may be problematic for a resampler to provide ``transform`` if ``Pipeline``s
+It may be problematic for a resampler to provide ``transform`` if Pipelines
 support resampling:
 
 1. It is unclear what to do at test time if a resampler has a transform
@@ -155,12 +167,9 @@ presents several problems:
 
 1. A resampling ``Pipeline`` needs to use a special code path for
    ``fit_transform`` that would call ``fit(X, y, **kw).transform(X)`` on the
-   ``Pipeline``.  Ordinarily a ``Pipeline`` would pass the transformed data to
-   ``fit_transform`` of the left step. If the ``Pipeline`` contains a
-   resampler, it rather needs to fit the ``Pipeline`` excluding the last step,
-   then transform the original training data until the last step, then
-   ``fit_transform`` the last step. This means special code paths for pipelines
-   containing resamplers; the effect of the resampler is not localised in terms
+   ``Pipeline``, rather than calling ``fit_transform`` on the last step.
+   Doing so would result in the transformation of the resampled data.
+   Thus the effect of the resampler is not localised in terms
    of code maintenance.
 2. As a result of issue 1, appending a step to the transformation ``Pipeline``
    means that the transformer which was previously last, and previously trained
@@ -168,24 +177,9 @@ presents several problems:
 3. As a result of issue 1, the last step cannot be ``'passthrough'`` as in
    other transformer pipelines.
 
-For this reason, it may be best to disable ``fit_transform`` and ``transform``
-on the Pipeline. A resampling ``Pipeline`` would therefore not be usable as a
-transformation within a ``FeatureUnion`` or ``ColumnTransformer``. Thus the
-``ResampledTrainer`` would be strictly more expressive than a resampling
-``Pipeline``.
-
-.. rubric:: Handling ``fit`` parameters
-
-Sample props or weights cannot be routed to steps downstream of a resampler in
-a Pipeline, unless they too are resampled. To support this, a resampler
-would need to be passed all props that are required downstream, and
-``fit_resample`` should return resampled versions of them. Note that these
-must be distinct from parameters that affect the resampler's fitting.
-That is, consider the signature ``fit_resample(X, y=None, props=None, sample_weight=None)``.
-The ``sample_weight`` passed in should affect the resampling, but does not
-itself need to be resampled. A Pipeline would pass ``props`` including the fit
-parameters required downstream, which would be resampled and returned by
-``fit_resample``.
+A resampler changes the semantics of a Pipeline, and arguably makes it
+ambiguous to the user where the resampler is followed by one or more
+transformers.
 
 Example Usage:
 ~~~~~~~~~~~~~~
@@ -202,12 +196,52 @@ Example Usage:
     )
     est.fit(X,y, sgdclassifier__sample_weight=my_weight)
 
+Handling ``fit`` parameters
+---------------------------
 
-Alternative implementation
-..........................
+Sample metadata ("sample props") including weights cannot be routed to steps
+downstream of a resampler in a Pipeline, unless they too are resampled. To
+support this, a resampler would need to be passed all props that are required
+downstream, and ``fit_resample`` should return resampled versions of them.
+If a resampler does not support resampling all the fit parameters it is passed,
+it should raise a TypeError.
 
-Alternatively ``sample_weight`` could be used as a placeholder to
-perform resampling. However, the current limitations are:
+Some ambiguity arises when the resampler both uses sample-aligned metadata to
+its ``fit_resample`` method, and is capable of resampling additional metadata.
+For example, if a resampler supports weighted fitting, but also returns a
+resampled version of each sample-aligned property it is given, should
+``fit_resample(X, y, sample_weight=sample_weight)`` result in ``sample_weight``
+being resampled, consumed, or both?
+
+Solutions:
+
+* Require that any metadata that should be resampled must have a prefix that
+  signifies that it should be resampled. The prefix may then be dropped in the
+  dict of keyword values returned by ``fit_resample``.
+* With the solution for SLEP006 found in :issue:`16079`: all metadata passed is
+  resampled. However, the `ResampledTrainer` only   
+
+Alternatives to Resamplers
+--------------------------
+
+Alternative: Resamplers as metaestimators
+.........................................
+
+One alternative solution would require all resamplers to be implemented as
+wrappers to another estimator, rather than the decoupling of resampler and
+meta-estimator assumed in ``ResampledTrainer``.
+
+This is already feasible in Scikit-learn, but:
+
+* it fails to make clear what the "one obvious way to do it" is for users.
+* there are tricky edge cases for metaestimator implementation, especially
+  when the meta-estimator can act as a classifier, regressor, transformer, etc.
+
+Alternative: sample_weight modification only
+............................................
+
+Alternatively ``sample_weight`` could be used as a way to effectively perform
+resampling, including sample removal. However, the current limitations are:
 
 * ``sample_weight`` is not available for all estimators;
 * ``sample_weight`` will implement only simple resampling (only when resampling
@@ -215,20 +249,44 @@ perform resampling. However, the current limitations are:
 * ``sample_weight`` needs to be passed and modified within a
   ``Pipeline``, which isn't possible without something like resamplers.
 
+Support for fit_resample in existing estimators
+-----------------------------------------------
+
+Outlier detectors should be provided with ``fit_resample``, allowing them to
+act as outlier removers.
+
+Initially, we do not have justification to add ``fit_resample`` support to
+metaestimators, including Pipeline, GridSearchCV, etc. These could be added
+at a later point.
+
 Current implementation
-......................
+----------------------
 
 https://github.com/scikit-learn/scikit-learn/pull/13269
 
 Backward compatibility
 ----------------------
 
-There is no backward incompatibilities with the current API.
+There are no backward incompatibilities with the current API.
 
 Discussion
 ----------
 
 * https://github.com/scikit-learn/scikit-learn/pull/13269
+
+Naming
+......
+
+Alternatives to "Resampler" and ``fit_resample`` that were considered include:
+
+* ``fit_rewrite``
+
+Alternatrives to ``ResampledTrainer`` that were considered include:
+
+* ``ResamplingTrainer``
+* ``Resampled``
+* ``WithResampling``
+* ``TrainWith``
 
 References and Footnotes
 ------------------------
